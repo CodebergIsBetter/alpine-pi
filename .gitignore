@@ -1,0 +1,35 @@
+# Build output
+/out/
+*.img
+*.img.xz
+*.img.zst
+SHA256SUMS
+
+# QEMU test scratch. T1 is the only test that still uses a scratch dir and it
+# makes one under /tmp; these two are the default output directories of the
+# deleted full-system tests, kept ignored so an old working tree does not
+# suddenly start offering them for commit.
+/qemu-work/
+/qemu-fb-out/
+*.log
+
+# Default output directories of the two chroot tests (T2 and T3), and the
+# frames T3 captures. Both take an outdir argument, so these are only the
+# defaults you get from running them by hand; build.yml points them at out/.
+/chroot-test-*/
+/headless-render-*/
+*.ppm
+
+# Upstream checkouts fetched by the build
+/checkout/
+
+# Linter, interpreter and test caches. All three are written by the lint steps
+# in .github/workflows/lint.yml (ruff check, python3 -m py_compile, pytest),
+# so they appear simply from running the checks locally. .pytest_cache/ does
+# ship its own .gitignore containing "*", which self-ignores it, but that is
+# pytest's behaviour and not this repo's - naming it here means the directory
+# stays out of a commit even if that file is removed or "git add -f" is used.
+__pycache__/
+*.pyc
+.ruff_cache/
+.pytest_cache/

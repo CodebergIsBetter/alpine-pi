@@ -1,0 +1,586 @@
+# Build, test and publish the three alpine-pi images.
+#
+# Cadence: weekly, Sundays 06:30 UTC. The reasoning in full, including the two
+# operational caveats and the daily canary this does NOT do, is in
+# docs/cadence.md. Briefly: the inputs move at very different rates. Alpine
+# edge changes daily, the pmbootstrap/pmaports forks are rebased onto upstream
+# daily, and the device port itself changes rarely. Weekly is frequent enough
+# that a break is found while the cause is still one week of upstream churn
+# wide, and rare enough that the release list stays readable. 06:30 UTC is
+# deliberately after the 04:17 UTC rebase jobs in the fork repos, so a build
+# picks up a tree that has already been rebased and, if the rebase failed, the
+# build uses the last good tree rather than racing it.
+name: Build images
+
+on:
+  schedule:
+    - cron: "30 6 * * 0"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Create a GitHub release from this run"
+        type: boolean
+        default: false
+      variants:
+        description: "Space separated subset to build (default: all three)"
+        type: string
+        default: "headless sway xfce4"
+  # Changing the build or test scripts should prove itself immediately, but
+  # must not publish.
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - "config/**"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: build-images
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [headless, sway, xfce4]
+    runs-on: ubuntu-latest
+    # TWO BUDGETS, ADDED UP. They are different kinds of number and must not
+    # be traded against each other:
+    #
+    #   THE TESTS have a hard five minute ceiling each, enforced by timeout(1)
+    #   inside the scripts rather than by this file - ic_bootstrap() in
+    #   scripts/lib/image-chroot.sh refuses a budget over 300s outright - so
+    #   their worst case is arithmetic, not a guess:
+    #     T1  90s cap + ~30s of mtools extraction and power-of-two SD padding
+    #     T2  300s cap  (measured 8-11s)
+    #     T3  300s cap  (measured 10-19s; headless skips in ~1s)
+    #     = 12 minutes worst case, about 2 minutes in practice.
+    #
+    #   THE IMAGE BUILD has no ceiling and cannot be given one. It is a real
+    #   armhf build under qemu-user emulation and xfce4 pulls ~480 packages;
+    #   nothing about the five minute test rule makes apk faster. It gets 120
+    #   minutes of its own on the step below, which is the per-variant run
+    #   time docs/cadence.md already assumed.
+    #
+    #   Plus ~18 minutes of everything else: checkout, apt, reclaiming disk,
+    #   xz -6 over a 2.4 GB image, and uploading ~400 MB of artifacts.
+    #
+    # 120 + 12 + 18 = 150. It was 210, of which 42 minutes were the old tiers'
+    # caps (120s + 600s + 1800s). Those could only ever grow, because a
+    # full-system TCG boot has no predictable duration; these cannot, because
+    # a test that needs longer is now rejected by the script instead of being
+    # accommodated here.
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      # The dispatch input arrives through the environment rather than being
+      # interpolated into the script text: ${{ }} substitution happens before
+      # bash sees the line, so a value containing a quote would otherwise
+      # rewrite this step's shell.
+      - name: Skip variants not requested
+        id: want
+        env:
+          REQUESTED: ${{ github.event.inputs.variants }}
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          requested="${REQUESTED:-headless sway xfce4}"
+          case " $requested " in
+            *" $VARIANT "*) echo "build=yes" >> "$GITHUB_OUTPUT" ;;
+            *) echo "build=no" >> "$GITHUB_OUTPUT"; echo "::notice::$VARIANT not requested" ;;
+          esac
+
+      # A hosted runner has ~14 GB free on /. One image is ~2.4 GB, and
+      # pmbootstrap also needs a native chroot, an armhf rootfs chroot and an
+      # apk cache. Reclaiming the preinstalled toolchains buys ~25 GB.
+      - name: Free disk space
+        if: steps.want.outputs.build == 'yes'
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/local/lib/node_modules || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Install dependencies
+        if: steps.want.outputs.build == 'yes'
+        run: |
+          sudo apt-get update -qq
+          # qemu-user-static + binfmt-support: two jobs at once. pmbootstrap
+          #   builds the device package inside an armhf chroot and there is no
+          #   gcc-armhf cross compiler in pmaports any more, so the build runs
+          #   under emulation; and T2/T3 run the finished image's own armhf
+          #   binaries the same way. Installing the pair also registers the
+          #   qemu-arm binfmt_misc handler - which the next step verifies
+          #   rather than assumes, because that registration is the one thing
+          #   both chroot tests cannot work without.
+          # qemu-system-arm + mtools: T1 and only T1. It is the last test that
+          #   boots a kernel, and mtools pulls the kernel, initramfs and DTB
+          #   out of the image's FAT partition with no loop device and no root
+          #   (mtools' img@@OFFSET addresses the FAT filesystem, and the
+          #   filenames are discovered with "mdir -b" rather than hardcoded).
+          # kpartx: one of pmbootstrap's own required_programs (it maps the
+          #   image's partitions for the install step). Every other name on
+          #   that list is in the hosted runner image already; this one is not,
+          #   and pmbootstrap aborts in its pre-flight check with "Can't find
+          #   all programs required to run pmbootstrap" before it reads the
+          #   config, so the build fails in seconds for a missing package.
+          # openssl: on that same required_programs list; named here so the
+          #   list does not depend on the runner image happening to ship it.
+          # util-linux: losetup, unshare, mountpoint and sfdisk - how
+          #   scripts/lib/image-chroot.sh loop-mounts one partition read-only
+          #   inside a private mount namespace.
+          # xz-utils: release assets are compressed because they have to be,
+          #   not to be tidy - GitHub caps one asset at 2 GiB and the sway and
+          #   xfce4 images exceed that raw.
+          #
+          # Gone, with the full-system tests they existed for: netcat-openbsd
+          # (drove QEMU's monitor socket to trigger "screendump"),
+          # squashfs-tools + cpio + kmod (unpacked the 66 MB armv7 netboot
+          # modloop and rebuilt its initramfs with an ext4 module in it),
+          # e2fsprogs (read the session log back out of a qcow2 with debugfs)
+          # and qemu-utils (made that qcow2). Nothing invokes any of them now;
+          # the chroot tests use an overlayfs over a read-only loop device.
+          sudo apt-get install -y --no-install-recommends \
+            qemu-user-static binfmt-support \
+            qemu-system-arm mtools kpartx \
+            xz-utils util-linux openssl git python3
+          qemu-system-arm --version | head -1
+
+      # CHECKED EXPLICITLY, NOT LEFT TO A PACKAGE'S POSTINST, because it is the
+      # single thing T2 and T3 cannot run without. With no enabled qemu-arm
+      # handler the kernel does not know what to do with an ARM ELF and every
+      # binary in the chroot dies with "Exec format error" - which is exactly
+      # what this project's own workstation looked like: qemu-user-static
+      # installed, /var/lib/binfmts/qemu-arm present, 25 other architectures
+      # registered, and qemu-arm alone never imported.
+      #
+      # The scripts self-heal as well (ic_binfmt in scripts/lib/image-chroot.sh
+      # does these same three things), so this step is not load-bearing - it is
+      # here so that a registration failure shows up as its own red step with
+      # the reason in it, instead of as a chroot test that inexplicably fails
+      # every assertion at once.
+      - name: Register the armhf binfmt handler
+        if: steps.want.outputs.build == 'yes'
+        run: |
+          set -euo pipefail
+          entry=/proc/sys/fs/binfmt_misc/qemu-arm
+          enabled() { [ -e "$entry" ] && grep -qx enabled "$entry"; }
+
+          # Debian/Ubuntu already ship the definition in /var/lib/binfmts and
+          # only need it imported into the kernel's table.
+          enabled || sudo update-binfmts --import qemu-arm || true
+          # The donor project's pattern, and the one that still works where
+          # /var/lib/binfmts does not exist at all.
+          enabled || docker run --privileged --rm tonistiigi/binfmt --install arm || true
+
+          if ! enabled; then
+            echo "::error::no enabled qemu-arm binfmt_misc handler; the armhf chroot tests cannot run"
+            ls /proc/sys/fs/binfmt_misc || true
+            exit 1
+          fi
+          cat "$entry"
+          # The handler is only half of it: the interpreter it names has to
+          # work too, and a broken qemu-user is otherwise indistinguishable
+          # from a broken image.
+          qemu-arm-static --version | head -1
+
+      # The image's filename is not spelled out anywhere below: the device name
+      # in it comes from config/alpinepi.env, which is the single source of
+      # truth for it, so build-image.sh reports the path it actually wrote and
+      # every later step uses that. Hardcoding "raspberry-pi0" here would
+      # silently break every test and upload path the day the device changes.
+      #
+      # timeout-minutes here, and not only on the job, so the two budgets can
+      # be read apart: this is the slow part and it is NOT under the five
+      # minute test rule. If it ever hits 120 minutes the cause is the build
+      # (an apk mirror crawling, or qemu-user grinding through a cold xfce4),
+      # never a test, because every test is capped long before this is.
+      - name: Build ${{ matrix.variant }}
+        id: build
+        if: steps.want.outputs.build == 'yes'
+        timeout-minutes: 120
+        run: ./scripts/build-image.sh "${{ matrix.variant }}" "$PWD/out"
+
+      # ------------------------------------------------------------------ #
+      # THE THREE TESTS
+      #
+      # Every one finishes in five minutes or less, and the ceiling is
+      # mechanical rather than aspirational: T1 takes its cap as an argument
+      # to timeout(1), T2 and T3 re-exec themselves under "timeout 300" and
+      # refuse a larger budget outright. An overrun is reported as a test
+      # FAILURE with a message that says so - there is no "expected slow"
+      # test here and no timeout to raise.
+      #
+      # Why they are not full-system boots any more: the images are ARMv6 and
+      # every runner is x86_64, so they can only run emulated, and the two
+      # kinds of emulation differ by orders of magnitude. Full-system TCG
+      # emulates a machine and boots a kernel - minutes. User-mode qemu
+      # translates userspace instructions inside a chroot - seconds, and it is
+      # what pmbootstrap already uses to BUILD these images. Only T1 still
+      # needs a machine, because a chroot cannot exercise a kernel or a DTB.
+      #
+      # NONE OF THEM MAY HIDE A FAILURE. T1's runner is wrapped in "|| true"
+      # for exactly one reason - a QEMU killed by its own timeout exits 124 and
+      # the log it produced is still the thing being judged - and the judge
+      # that follows it is a separate, unguarded command. T2 and T3 exit 0 or 1
+      # cleanly and are not wrapped at all. A red test skips the image upload
+      # below, which has no always(), which skips publish. That chain is the
+      # point: a failing test publishes nothing.
+      # ------------------------------------------------------------------ #
+
+      # T1: the image's own linux-rpi kernel on QEMU's raspi1ap, with the
+      # image's own DTB. The only test that runs a real kernel, and the only
+      # reason qemu-system-arm is still installed.
+      #
+      # It cannot reach OpenRC and is not supposed to: QEMU's bcm2835-dma
+      # emulation emits bus addresses past 0x5fffffff, so every SD read fails
+      # and the run ends in the initramfs emergency shell. That ending is
+      # EXPECTED, and scripts/assert-boot-log.py keeps its FATAL patterns keyed
+      # per tier so that it stays expected. 90s cap, measured 60-90s.
+      # pmbootstrap's "shutdown", which build-image.sh runs at the end of every
+      # build, calls pmb.chroot.binfmt.unregister() and deletes the handler
+      # registered above - silently, because that output is suppressed. The
+      # chroot tests then cannot execute a single armhf binary and fail with
+      # "no enabled qemu-arm handler" on an image that is perfectly fine.
+      #
+      # The scripts do try to self-heal, but from inside their own mount and
+      # pid namespace, where neither update-binfmts' state nor a container
+      # runtime is reliably reachable. Registering here, at the top level and
+      # after the build, is the arrangement that is known to work: it is the
+      # same block as above, which succeeds on this runner every time.
+      - name: Re-register the armhf binfmt handler (the build removes it)
+        if: steps.want.outputs.build == 'yes'
+        run: |
+          set -euo pipefail
+          entry=/proc/sys/fs/binfmt_misc/qemu-arm
+          enabled() { [ -e "$entry" ] && grep -qx enabled "$entry"; }
+
+          # Debian/Ubuntu already ship the definition in /var/lib/binfmts and
+          # only need it imported into the kernel's table.
+          enabled || sudo update-binfmts --import qemu-arm || true
+          # The donor project's pattern, and the one that still works where
+          # /var/lib/binfmts does not exist at all.
+          enabled || docker run --privileged --rm tonistiigi/binfmt --install arm || true
+
+          if ! enabled; then
+            echo "::error::no enabled qemu-arm binfmt_misc handler; the armhf chroot tests cannot run"
+            ls /proc/sys/fs/binfmt_misc || true
+            exit 1
+          fi
+          cat "$entry"
+          # The handler is only half of it: the interpreter it names has to
+          # work too, and a broken qemu-user is otherwise indistinguishable
+          # from a broken image.
+          qemu-arm-static --version | head -1
+
+      # The image's filename is not spelled out anywhere below: the device name
+      # in it comes from config/alpinepi.env, which is the single source of
+      # truth for it, so build-image.sh reports the path it actually wrote and
+      # every later step uses that. Hardcoding "raspberry-pi0" here would
+      # silently break every test and upload path the day the device changes.
+      #
+      # timeout-minutes here, and not only on the job, so the two budgets can
+      # be read apart: this is the slow part and it is NOT under the five
+      # minute test rule. If it ever hits 120 minutes the cause is the build
+      # (an apk mirror crawling, or qemu-user grinding through a cold xfce4),
+      # never a test, because every test is capped long before this is.
+      - name: T1 kernel and device tree (qemu-system-arm raspi1ap)
+        if: steps.want.outputs.build == 'yes'
+        run: |
+          ./scripts/qemu-raspi-boot.sh \
+            "${{ steps.build.outputs.image }}" 90 \
+            "out/qemu-raspi-${{ matrix.variant }}.log" || true
+          ./scripts/assert-boot-log.py raspi "out/qemu-raspi-${{ matrix.variant }}.log"
+
+      # T2: the image's armhf userspace, in a chroot under user-mode qemu.
+      # This is where "the binaries actually run" is proved: it executes the
+      # variant's UI binaries and records their versions, runs wpa_supplicant,
+      # dhcpcd, openrc and apk, "sh -n"s every /etc/init.d script, resolves
+      # every runlevel symlink and every enabled service's command, checks
+      # inittab and the passwd/shadow/group set, walks the whole filesystem for
+      # dangling and ELOOP symlinks, and reproduces tinydm's own autologin-uid
+      # and XDG_RUNTIME_DIR lookups AS the autologin user.
+      #
+      # Every one of those assertions exists because a real bug got past the
+      # old tests: a missing XDG_RUNTIME_DIR that killed the compositor, an
+      # eudev sbin/udevadm symlink loop, a tinydm session pointing at the wrong
+      # .desktop, an xfce4 image with no icon theme.
+      #
+      # It never writes to the image: the rootfs partition is loop-mounted
+      # read-only and an overlayfs with a tmpfs upper carries the writes.
+      # 300s cap, measured 8-11s.
+      - name: T2 userspace, in an armhf chroot
+        if: steps.want.outputs.build == 'yes'
+        run: |
+          ./scripts/chroot-test.sh \
+            "${{ steps.build.outputs.image }}" \
+            "${{ matrix.variant }}" "out/chroot-${{ matrix.variant }}"
+
+      # T3: did the compositor put pixels up? A session can log that it is
+      # running and still present black - this project has shipped that twice -
+      # so this one is judged on pixels and nothing else.
+      #
+      # It starts the image's OWN session (resolved from /var/lib/tinydm/
+      # default-session.desktop, launched exactly as tinydm-run-session does,
+      # as the image's own autologin uid) against wlroots' HEADLESS backend,
+      # which needs no GPU, no DRM device and no kernel; screenshots it with
+      # the image's own grim into a PPM; and classifies the frame with
+      # scripts/analyse-framebuffer.py. sway and xfce4 must reach "graphical".
+      #
+      # HEADLESS IS NOT GIVEN AN EXPECTED VERDICT, because it has no
+      # compositor and inventing one would mean testing a getty that does not
+      # exist in a chroot. The script SKIPs it - but it is still invoked for
+      # that variant, because the skip has teeth: it FAILS if a compositor
+      # binary, a wayland-sessions directory or a tinydm session file turns up
+      # in the headless image, which is how a leak in the variant selection
+      # would present. That costs about a second.
+      #
+      # What it cannot see: there is no vc4, no KMS and no 64 MB CMA pool
+      # here, so GPU-specific and memory-pressure failures stay hardware-only,
+      # and nothing here measures frame rate. 300s cap, measured 10-19s.
+      - name: T3 session renders, in an armhf chroot (headless skips)
+        if: steps.want.outputs.build == 'yes'
+        run: |
+          ./scripts/headless-render-test.sh \
+            "${{ steps.build.outputs.image }}" \
+            "${{ matrix.variant }}" "out/render-${{ matrix.variant }}"
+
+      # GitHub caps a single release asset at 2 GiB and the sway and xfce4
+      # images exceed that raw, so compression is required, not cosmetic. It
+      # also pays for itself: most of the image is unallocated.
+      - name: Compress
+        if: steps.want.outputs.build == 'yes'
+        run: |
+          cd out
+          IMG="${{ steps.build.outputs.name }}.img"
+          xz -T0 -6 -v "$IMG"
+          sha256sum "$IMG.xz" > "$IMG.xz.sha256"
+          ls -lh
+          echo "compressed to $(stat -c %s "$IMG.xz") bytes"
+
+      - uses: actions/upload-artifact@v4
+        if: steps.want.outputs.build == 'yes'
+        with:
+          name: alpinepi-${{ matrix.variant }}
+          path: |
+            out/*.img.xz
+            out/*.sha256
+          retention-days: 14
+
+      # Logs are the only way to diagnose a failure after the fact, so keep
+      # them whether or not the run passed: T1's serial dump and T2's full
+      # assertion list, every line of it, not just the ones that failed.
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.want.outputs.build == 'yes'
+        with:
+          name: test-logs-${{ matrix.variant }}
+          path: |
+            out/*.log
+            out/chroot-${{ matrix.variant }}/
+          if-no-files-found: warn
+          retention-days: 14
+
+      # The frame, its verdict and the session's own log, uploaded on success
+      # as well as on failure. A surprising verdict is only diagnosable by
+      # LOOKING at the pixels - the classifier's thresholds are deliberately
+      # loose, so "graphical" on an image that should not be is as much worth
+      # eyeballing as a failure is. frame.ppm opens in any image viewer;
+      # ImageMagick is not needed. Empty for headless, which renders nothing,
+      # hence if-no-files-found: warn.
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.want.outputs.build == 'yes'
+        with:
+          name: render-${{ matrix.variant }}
+          path: out/render-${{ matrix.variant }}/
+          if-no-files-found: warn
+          retention-days: 14
+
+  publish:
+    needs: build
+    # Only on the weekly schedule or an explicit opt-in. A push that touches
+    # the scripts builds and tests but deliberately publishes nothing.
+    if: |
+      success() && (
+        github.event_name == 'schedule' ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true')
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: alpinepi-*
+          merge-multiple: true
+          path: dist
+
+      - name: Assemble checksums
+        id: meta
+        run: |
+          cd dist
+          # All three images or no release at all. A dispatch can ask for a
+          # subset, and a matrix leg that was not requested ends GREEN with no
+          # artifacts, so success() on its own would publish a release whose
+          # body promises three images, and a SHA256SUMS covering only the ones
+          # that happened to be downloaded.
+          n=$(find . -maxdepth 1 -name '*.img.xz' | wc -l)
+          if [ "$n" -ne 3 ]; then
+            echo "::error::only $n of 3 images are present - refusing to publish a partial release"
+            exit 1
+          fi
+          rm -f SHA256SUMS
+          # Recompute rather than concatenating the per-job .sha256 files, so
+          # the published list cannot disagree with the published bytes.
+          sha256sum *.img.xz > SHA256SUMS
+          cat SHA256SUMS
+
+          # The date alone is not a unique tag. action-gh-release creates the
+          # tag only when it does not exist yet and otherwise UPDATES the
+          # existing release in place, overwriting same-named assets - so a
+          # second publishing run on the same day would replace the bytes
+          # behind a tag that still resolves to the earlier commit, with
+          # nothing recording that it changed. The weekly schedule cannot hit
+          # that, but a "workflow_dispatch with publish: true" re-run after a
+          # fix is exactly how it would happen, so a repeat gets its own tag.
+          tag="v$(date -u +%Y.%m.%d)"
+          if git -C "$GITHUB_WORKSPACE" ls-remote --exit-code --tags origin \
+              "refs/tags/$tag" >/dev/null 2>&1; then
+            tag="$tag-r$GITHUB_RUN_NUMBER"
+            echo "::notice::today's tag already exists, publishing as $tag"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      # Published with the GitHub CLI rather than a release action, and as a
+      # draft that is only revealed once every asset is attached.
+      #
+      # Two different uploaders have now failed part-way through:
+      # softprops/action-gh-release with "Error creating asset temp dir" after
+      # 5 of 7 files, and "gh release create" with "HTTP 500: Error saving
+      # asset" on the second image. Neither is atomic server-side, so the
+      # failure mode both times was a release advertising three images and
+      # shipping fewer.
+      #
+      # So: create the release empty and hidden, attach each file in its own
+      # call so a transient 500 can be retried instead of losing the whole
+      # upload, refuse to continue unless every asset reports state=uploaded,
+      # and only then clear the draft flag. A run that dies anywhere in the
+      # middle leaves a draft nobody can download rather than a published
+      # release that lies about its contents.
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          cat > /tmp/notes.md <<'NOTES'
+          Read the README to see how to flash Alpine Linux for the raspberry pi zero w
+          NOTES
+
+          n=$(ls dist/*.img.xz 2>/dev/null | wc -l)
+          if [ "$n" -ne 3 ]; then
+            echo "::error::only $n of 3 images are present - refusing to publish a partial release"
+            exit 1
+          fi
+          ls -l dist/
+
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+
+          # --target pins the release to the commit that was actually built,
+          # rather than to whatever the default branch points at when the
+          # draft is published.
+          gh release create "$TAG" \
+            --draft \
+            --target "$GITHUB_SHA" \
+            --title "alpine-pi $TAG" \
+            --notes-file /tmp/notes.md
+
+          for f in dist/*.img.xz dist/SHA256SUMS; do
+            for attempt in 1 2 3 4 5; do
+              if gh release upload "$TAG" "$f" --clobber; then
+                echo "uploaded $(basename "$f")"
+                continue 2
+              fi
+              echo "::warning::upload of $(basename "$f") failed on attempt $attempt"
+              sleep $((attempt * 20))
+            done
+            echo "::error::gave up uploading $(basename "$f") after 5 attempts"
+            exit 1
+          done
+
+          # An asset row exists as soon as an upload starts, so count the ones
+          # that finished rather than the ones that were attempted.
+          want=$(ls dist/*.img.xz dist/SHA256SUMS | wc -l)
+          got=$(gh release view "$TAG" --json assets \
+            --jq '[.assets[] | select(.state == "uploaded")] | length')
+          if [ "$got" -ne "$want" ]; then
+            echo "::error::$got of $want assets finished uploading - leaving the release as a draft"
+            exit 1
+          fi
+
+          gh release edit "$TAG" --draft=false --latest
+
+          echo "published:"
+          gh release view "$TAG" --json assets \
+            --jq '.assets[] | "  " + .name + "  " + (.size|tostring) + " bytes"'
+
+  report-failure:
+    needs: [build, publish]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const label = "build-failure";
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}` +
+                        `/actions/runs/${context.runId}`;
+            const body = [
+              `The \`${context.eventName}\` image build failed.`,
+              "",
+              `Run: ${run}`,
+              "",
+              "Check which matrix leg failed and at which step. T1's serial dump",
+              "and T2's full assertion list are attached to the run as",
+              "`test-logs-<variant>`; they are the only way to diagnose a",
+              "regression after the fact. A T3 failure needs the frame itself,",
+              "which is in the `render-<variant>` artifact alongside the verdict",
+              "and, if the session started at all, its own log.",
+              "",
+              "Common causes, roughly by likelihood:",
+              "",
+              "- the daily rebase of the pmbootstrap or pmaports fork hit a",
+              "  conflict and left the branch behind upstream, so the build used",
+              "  a stale tree",
+              "- an Alpine edge package changed underneath the port (the kernel",
+              "  and the brcmfmac firmware are the ones that bite)",
+              "- the runner ran out of disk; one image plus its chroots is tight",
+              "  on a hosted runner even after reclaiming the toolchains",
+              "",
+              "This issue is reused for later failures; close it once a build",
+              "goes green.",
+            ].join("\n");
+
+            try {
+              await github.rest.issues.createLabel({
+                ...context.repo, name: label, color: "b60205",
+                description: "A scheduled image build failed",
+              });
+            } catch (e) {
+              if (e.status !== 422) throw e; // already exists
+            }
+
+            const { data: open } = await github.rest.issues.listForRepo({
+              ...context.repo, state: "open", labels: label, per_page: 1,
+            });
+            if (open.length) {
+              await github.rest.issues.createComment({
+                ...context.repo, issue_number: open[0].number, body });
+            } else {
+              await github.rest.issues.create({
+                ...context.repo, title: "Scheduled image build failed", body,
+                labels: [label] });
+            }

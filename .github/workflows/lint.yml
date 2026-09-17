@@ -1,0 +1,133 @@
+# Cheap checks that run on every push, so a typo in a build script is caught in
+# seconds rather than three hours into a weekly image build.
+name: Lint
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Every glob here is a "find", not scripts/*.sh plus a hand-maintained
+      # list of subdirectories. The listed form was already one directory
+      # behind reality once: scripts/lib/ appeared when shared scaffolding was
+      # extracted, and a scripts/ci/ came and went, so a file could be added in
+      # a subdirectory and never be checked by anything. A find cannot fall
+      # behind - and scripts/lib/ now holds the two payload scripts that run
+      # INSIDE the armhf chroot, which is exactly the code that is hardest to
+      # debug when it is wrong and easiest to leave unchecked.
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends shellcheck
+          find scripts -name '*.sh' -print0 | xargs -0 -r \
+            shellcheck --severity=warning
+
+      - name: bash syntax
+        run: find scripts -name '*.sh' -print0 | xargs -0 -r -n1 bash -n
+
+      # .github/workflows/build.yml invokes every one of these as a PROGRAM
+      # ("./scripts/build-image.sh ..."), so a mode of 100644 in the index is a
+      # "Permission denied" on the runner and nothing else: the build dies at
+      # its first step, on every variant, and no other check here would notice
+      # - shellcheck and "bash -n" read files, they do not execute them.
+      #
+      # The bits cannot be inferred from the working tree either. This repo is
+      # developed on a filesystem that reports 0777 for every file, so
+      # core.fileMode is false in that clone and a newly added script is
+      # recorded 100644 however executable it looks locally. Only what git has
+      # recorded matters, which is exactly what this reads.
+      #
+      # scripts/lib/ is excluded deliberately. image-chroot.sh is sourced, and
+      # chroot-assert.sh / chroot-session.sh are copied into the chroot and run
+      # as "sh <file>" - no path in either case needs an exec bit, and the
+      # files are not on the host's PATH at all.
+      - name: scripts are executable in git
+        run: |
+          git ls-files -s scripts
+          bad="$(git ls-files -s scripts | grep -v '^100755' \
+                 | grep -v 'scripts/lib/' || true)"
+          if [ -n "$bad" ]; then
+            echo "ERROR: not executable in git. Fix with"
+            echo "  git update-index --chmod=+x <path>"
+            echo "$bad"
+            exit 1
+          fi
+
+      # Run the judge's own tests FIRST and with nothing installed. It is the
+      # one piece of this repo that can fail OPEN - a typo in a FATAL pattern
+      # means an image whose kernel panicked is reported PASS and becomes
+      # eligible to publish - and it is written with no third-party imports
+      # precisely so that this check cannot be skipped for want of a wheel.
+      - name: tests (no dependencies)
+        run: python3 tests/test_assert_boot_log.py
+
+      # Then the whole suite, which does need pytest. Without this step the
+      # two vendored test files are decoration: nothing else executes them.
+      # test_framebuffer_analysis.py is the important one - it tests the
+      # classifier that decides T3's verdict, which is to say the thing that
+      # decides whether an image is published, and until it was vendored from
+      # the alpine-armv6 project nothing tested that judge at all.
+      #
+      # "import yaml, pytest" is asserted on its own line because
+      # test_workflows_parse.py is written to SKIP when PyYAML is missing, and
+      # a skipped test reads as green. If the install fails, this has to be a
+      # red step rather than a quiet 2-skipped.
+      - name: tests (pytest)
+        run: |
+          python3 -m pip install --quiet pytest pyyaml \
+            || python3 -m pip install --quiet --break-system-packages pytest pyyaml
+          python3 -c "import yaml, pytest"
+          python3 -m pytest tests/ -q
+
+      - name: python
+        run: |
+          find . -name '*.py' -not -path './.git/*' -print0 | xargs -0 -r \
+            python3 -m py_compile
+          pipx install ruff >/dev/null 2>&1 || pip install --quiet ruff
+          # "." rather than "scripts/": ruff.toml's per-file-ignores are
+          # written relative to the repo root, and a .py file added outside
+          # scripts/ still has to lint.
+          ruff check .
+
+      # (There used to be an inline "workflows parse as YAML" step here. It is
+      # now tests/test_workflows_parse.py, vendored from the alpine-armv6
+      # project, run by the pytest step above and also runnable on a laptop.
+      # It keeps the YAML 1.1 trap the inline version knew about - a bare "on:"
+      # key parses as the boolean True, so "on" in doc is False on a perfectly
+      # valid workflow - and adds a check that no step is missing both "run"
+      # and "uses". The incident behind it: a lint.yml whose own YAML was
+      # invalid, so the only check that could have caught it was the one that
+      # could no longer run.)
+
+      - name: config is sourceable and complete
+        run: |
+          set -a; . config/alpinepi.env; set +a
+          for v in ALPINEPI_DEVICE ALPINEPI_HOSTNAME ALPINEPI_USER ALPINEPI_PASSWORD \
+                   ALPINEPI_WIFI_SSID ALPINEPI_WIFI_PSK ALPINEPI_BRANCH \
+                   ALPINEPI_PMBOOTSTRAP_REPO ALPINEPI_PMAPORTS_REPO; do
+            [ -n "${!v:-}" ] || { echo "ERROR: $v is unset in config/alpinepi.env"; exit 1; }
+            echo "  $v is set"
+          done
+          # WPA2 will not accept anything shorter, and the failure surfaces
+          # deep inside a three hour build rather than here.
+          n=${#ALPINEPI_WIFI_PSK}
+          [ "$n" -ge 8 ] && [ "$n" -le 63 ] || { echo "ERROR: PSK must be 8..63 chars, got $n"; exit 1; }
+          echo "  PSK length $n is valid"
+          # The country is the one value that is allowed to be EMPTY - that is
+          # how the world regulatory domain is requested - but anything else
+          # has to be two letters, which is what pmbootstrap enforces with
+          # re.fullmatch(r"[A-Za-z]{2}") three hours into a build.
+          case "${ALPINEPI_WIFI_COUNTRY:-}" in
+            "") echo "  WIFI_COUNTRY is empty: world regulatory domain" ;;
+            [A-Za-z][A-Za-z]) echo "  WIFI_COUNTRY $ALPINEPI_WIFI_COUNTRY is a two letter code" ;;
+            *) echo "ERROR: ALPINEPI_WIFI_COUNTRY must be empty or two letters, got '$ALPINEPI_WIFI_COUNTRY'"; exit 1 ;;
+          esac

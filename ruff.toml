@@ -1,0 +1,27 @@
+# Ruff settings for the CI "python" lint step.
+#
+# This file exists because ruff's DEFAULT rule set is not stable across
+# ruff releases, and .github/workflows/lint.yml installs whatever ruff is
+# current ("pipx install ruff"). ruff 0.16 turned on most of pylint,
+# flake8-bugbear, pyupgrade and friends by default, so a repo that linted
+# clean on Monday can fail on Tuesday having changed nothing. Pinning the
+# rules here, rather than the ruff version, keeps that decision visible.
+target-version = "py310"
+
+[lint]
+# Ruff's own default selection, named explicitly so an upstream change to
+# what "default" means cannot fail the build on its own.
+select = ["E4", "E7", "E9", "F"]
+
+[lint.per-file-ignores]
+# scripts/analyse-framebuffer.py carries a classifier vendored from the
+# alpine-armv6 project (see its docstring). The comments are this repo's,
+# but the code is upstream's, kept functionally identical so a fix can
+# move either way as a readable diff.
+#
+# PLR1730 is the concrete case: ruff wants "min_x = min(min_x, x)" in
+# place of an if-guard. That is equivalent, but rewriting it would make
+# every future donor sync show a spurious conflict in a hot loop, for no
+# behavioural gain. Listed even though "select" above does not enable
+# PLR1730, so that raising "select" later does not silently reopen this.
+"scripts/analyse-framebuffer.py" = ["PLR1730"]
